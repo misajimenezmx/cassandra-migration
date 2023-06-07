@@ -6,6 +6,8 @@ import com.datastax.oss.driver.api.core.DriverException;
 import com.datastax.oss.driver.api.core.cql.*;
 import com.datastax.oss.driver.api.core.metadata.Metadata;
 import com.datastax.oss.driver.api.core.servererrors.InvalidQueryException;
+import org.cognitor.cassandra.migration.advisors.ExecutionAdvisor;
+import org.cognitor.cassandra.migration.advisors.ExecutionAdvisorsChain;
 import org.cognitor.cassandra.migration.cql.SimpleCQLLexer;
 import org.cognitor.cassandra.migration.keyspace.Keyspace;
 import org.slf4j.Logger;
@@ -16,7 +18,10 @@ import java.io.Closeable;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static java.lang.String.format;
 import static org.cognitor.cassandra.migration.util.Ensure.notNull;
@@ -43,7 +48,7 @@ public class Database implements Closeable {
     /**
      * Insert statement that logs a migration into the schema_migration table.
      */
-    private static final String INSERT_MIGRATION = "insert into %s"
+    private static final String INSERT_MIGRATION = "insert into %s.%s"
             + "(applied_successful, version, script_name, script, executed_at) values(?, ?, ?, ?, ?)";
 
     /**
@@ -99,12 +104,16 @@ public class Database implements Closeable {
     private final Keyspace keyspace;
     private final CqlSession session;
     private final ConsistencyLevel consistencyLevel = ConsistencyLevel.QUORUM;
+    private final String logMigrationStatementExpression;
     private final PreparedStatement logMigrationStatement;
+    private final String takeMigrationLeadStatementExpression;
     private final PreparedStatement takeMigrationLeadStatement;
+    private final String releaseMigrationLeadStatementExpression;
     private final PreparedStatement releaseMigrationLeadStatement;
     private String executionProfileName;
     private ConsistencyLevel migrationConsistencyLevel = ConsistencyLevel.QUORUM;
     private boolean tookLead = false;
+    private ExecutionAdvisorsChain advisors;
 
     /**
      * Deprecated in favour of <code>Database(CqlSession, MigrationConfiguration)</code>. This constructor
@@ -170,12 +179,16 @@ public class Database implements Closeable {
         this.executionProfileName = configuration.getExecutionProfile();
         this.tableName = createTableName(configuration.getTablePrefix(), SCHEMA_CF);
         this.leaderTableName = createTableName(configuration.getTablePrefix(), SCHEMA_LEADER_CF);
+        this.advisors = new ExecutionAdvisorsChain(session);
         createKeyspaceIfRequired();
         useKeyspace();
         ensureSchemaTables();
-        this.logMigrationStatement = this.session.prepare(format(INSERT_MIGRATION, getTableName()));
-        this.takeMigrationLeadStatement = session.prepare(format(TAKE_LEAD_QUERY, getLeaderTableName(), LEAD_TTL));
-        this.releaseMigrationLeadStatement = session.prepare(format(RELEASE_LEAD_QUERY, getLeaderTableName()));
+        this.logMigrationStatementExpression = format(INSERT_MIGRATION, this.keyspaceName, getTableName());
+        this.logMigrationStatement = this.session.prepare(this.logMigrationStatementExpression);
+        this.takeMigrationLeadStatementExpression = format(TAKE_LEAD_QUERY, getLeaderTableName(), LEAD_TTL);
+        this.takeMigrationLeadStatement = session.prepare(takeMigrationLeadStatementExpression);
+        this.releaseMigrationLeadStatementExpression = format(RELEASE_LEAD_QUERY, getLeaderTableName());
+        this.releaseMigrationLeadStatement = session.prepare(releaseMigrationLeadStatementExpression);
         String tmpInstanceAddress;
         try {
             tmpInstanceAddress = InetAddress.getLocalHost().getHostAddress();
@@ -188,7 +201,10 @@ public class Database implements Closeable {
 
     private void useKeyspace() {
         LOGGER.info("Changing keyspace of the session to '{}'", keyspaceName);
-        session.execute("USE " + keyspaceName);
+        String statement = "USE " + keyspaceName;
+        SimpleStatement cqlStatement = SimpleStatement.newInstance(statement);
+        session.execute(advisors.beforeExecute(statement, cqlStatement));
+        advisors.afterExecute(statement);
     }
 
     private static String createTableName(String tablePrefix, String tableName) {
@@ -203,7 +219,10 @@ public class Database implements Closeable {
             return;
         }
         try {
-            executeStatement(this.keyspace.getCqlStatement());
+            String statement = this.keyspace.getCqlStatement();
+            SimpleStatement cqlStatement = SimpleStatement.newInstance(statement);
+            session.execute(advisors.beforeExecute(statement, cqlStatement));
+            advisors.afterExecute(statement);
         } catch (DriverException exception) {
             throw new MigrationException(format("Unable to create keyspace %s.", keyspaceName), exception);
         }
@@ -229,7 +248,11 @@ public class Database implements Closeable {
      * @return the current schema version
      */
     public int getVersion() {
-        ResultSet resultSet = executeStatement(format(VERSION_QUERY, getTableName()));
+        String statement = format(VERSION_QUERY, getTableName());
+        SimpleStatement getVersionQuery = SimpleStatement.newInstance(statement)
+                .setConsistencyLevel(this.consistencyLevel);
+        ResultSet resultSet = session.execute(advisors.beforeExecute(statement, getVersionQuery));
+        advisors.afterExecute(statement);
         Row result = resultSet.one();
         if (result == null) {
             return 0;
@@ -280,8 +303,15 @@ public class Database implements Closeable {
 
 
     private void createSchemaTables() {
-        executeStatement(format(CREATE_MIGRATION_CF, getTableName()));
-        executeStatement(format(CREATE_LEADER_CF, getLeaderTableName()));
+        String migrationStatement = format(CREATE_MIGRATION_CF, getTableName());
+        SimpleStatement cqlMigrationStatement = SimpleStatement.newInstance(migrationStatement);
+        session.execute(advisors.beforeExecute(migrationStatement, cqlMigrationStatement));
+        advisors.afterExecute(migrationStatement);
+        
+        String leaderStatement = format(CREATE_LEADER_CF, getLeaderTableName());
+        SimpleStatement cqlLeaderStatement = SimpleStatement.newInstance(leaderStatement);
+        session.execute(advisors.beforeExecute(leaderStatement, cqlLeaderStatement));
+        advisors.afterExecute(leaderStatement);
     }
 
     /**
@@ -297,7 +327,8 @@ public class Database implements Closeable {
                 LOGGER.debug("Trying to take lead on schema migrations");
                 BoundStatement boundStatement = takeMigrationLeadStatement.bind(getKeyspaceName(), this.instanceId,
                         this.instanceAddress);
-                ResultSet lwtResult = executeStatement(boundStatement, this.consistencyLevel);
+                ResultSet lwtResult = session.execute(advisors.beforeExecute(takeMigrationLeadStatementExpression, boundStatement));
+                advisors.afterExecute(takeMigrationLeadStatementExpression);
 
                 if (lwtResult.wasApplied()) {
                     LOGGER.debug("Took lead on schema migrations");
@@ -335,7 +366,8 @@ public class Database implements Closeable {
             LOGGER.debug("Trying to release lead on schema migrations");
 
             BoundStatement boundStatement = releaseMigrationLeadStatement.bind(getKeyspaceName(), this.instanceId);
-            ResultSet lwtResult = executeStatement(boundStatement, this.consistencyLevel);
+            ResultSet lwtResult = session.execute(advisors.beforeExecute(releaseMigrationLeadStatementExpression, boundStatement));
+            advisors.afterExecute(releaseMigrationLeadStatementExpression);
 
             if (lwtResult.wasApplied()) {
                 LOGGER.debug("Released lead on schema migrations");
@@ -379,7 +411,11 @@ public class Database implements Closeable {
 
     private void executeMigrationStatement(String statement, DbMigration migration) {
         if (!statement.isEmpty()) {
-            ResultSet resultSet = executeStatement(statement);
+            SimpleStatement simpleStatement = SimpleStatement.newInstance(statement)
+                    .setExecutionProfileName(executionProfileName)
+                    .setConsistencyLevel(consistencyLevel);
+            ResultSet resultSet = session.execute(advisors.beforeExecute(statement, simpleStatement));
+            advisors.afterExecute(statement);
             if (!resultSet.getExecutionInfo().isSchemaInAgreement()) {
                 throw new MigrationException("Schema agreement could not be reached. " +
                         "You might consider increasing 'maxSchemaAgreementWaitSeconds'.",
@@ -407,7 +443,8 @@ public class Database implements Closeable {
     private void logMigration(DbMigration migration, boolean wasSuccessful) {
         BoundStatement boundStatement = logMigrationStatement.bind(wasSuccessful, migration.getVersion(),
                 migration.getScriptName(), migration.getMigrationScript(), Instant.now());
-        executeStatement(boundStatement, this.migrationConsistencyLevel);
+        session.execute(advisors.beforeExecute(logMigrationStatementExpression, boundStatement));
+        advisors.afterExecute(logMigrationStatementExpression);
     }
 
     /**
@@ -448,4 +485,17 @@ public class Database implements Closeable {
         this.executionProfileName = executionProfileName;
         return this;
     }
+
+    public List<Class<? extends ExecutionAdvisor>> getAdvisors() {
+        return advisors.getAdvisors();
+    }
+
+    public void setAdvisors(List<Class<ExecutionAdvisor>> advisors) {
+        this.advisors.setAdvisors(advisors);
+    }
+
+    public void addAdvisor(Class<ExecutionAdvisor> advisor) {
+        this.advisors.addAdvisor(advisor);
+    }
+
 }
